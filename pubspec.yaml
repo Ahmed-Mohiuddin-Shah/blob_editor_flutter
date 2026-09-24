@@ -1,0 +1,22 @@
+name: blob_editor
+description: BLOB Composition editor — portable Dart core + Android-first drop-in UI.
+version: 0.1.0
+homepage: https://github.com/blob/blob
+publish_to: none
+
+environment:
+  sdk: ^3.13.4
+  flutter: ">=3.47.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  google_fonts: ^8.2.1
+  image_picker: ^1.1.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
