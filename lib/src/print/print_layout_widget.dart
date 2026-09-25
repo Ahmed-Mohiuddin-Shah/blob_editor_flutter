@@ -60,6 +60,11 @@ class _PrintLayoutState extends State<PrintLayout> {
   String _preset = 'a4';
   bool _busy = false;
 
+  /// Pinch/rotate baseline captured at scale start.
+  String? _gestureId;
+  double _gestureBaseWidthMm = 40;
+  double _gestureBaseRotationDeg = 0;
+
   BorderRadius get _radius =>
       widget.blocky ? BorderRadius.zero : BorderRadius.circular(24);
 
@@ -508,18 +513,40 @@ class _PrintLayoutState extends State<PrintLayout> {
                           _selectedId = it.id;
                           _section ??= _PrintSection.transform;
                         }),
-                        onPanUpdate: (d) {
+                        onScaleStart: (details) {
                           final cur = findPrintItem(_doc, it.id);
                           if (cur == null) return;
+                          _gestureId = it.id;
+                          _gestureBaseWidthMm = cur.widthMm;
+                          _gestureBaseRotationDeg = cur.rotationDeg;
                           setState(() {
                             _selectedId = it.id;
-                            _doc = movePrintItem(
-                              _doc,
-                              it.id,
-                              cur.xMm + d.delta.dx * mmPerPx,
-                              cur.yMm + d.delta.dy * mmPerPx,
-                            );
+                            _section ??= _PrintSection.transform;
                           });
+                        },
+                        onScaleUpdate: (details) {
+                          final id = _gestureId ?? it.id;
+                          final cur = findPrintItem(_doc, id);
+                          if (cur == null) return;
+                          final nextW = (_gestureBaseWidthMm * details.scale)
+                              .clamp(8.0, page.widthMm);
+                          final nextRot = _gestureBaseRotationDeg +
+                              details.rotation * 180 / 3.141592653589793;
+                          setState(() {
+                            _selectedId = id;
+                            var next = movePrintItem(
+                              _doc,
+                              id,
+                              cur.xMm + details.focalPointDelta.dx * mmPerPx,
+                              cur.yMm + details.focalPointDelta.dy * mmPerPx,
+                            );
+                            next = resizePrintItem(next, id, nextW);
+                            next = rotatePrintItem(next, id, nextRot);
+                            _doc = next;
+                          });
+                        },
+                        onScaleEnd: (_) {
+                          _gestureId = null;
                         },
                         child: Transform.rotate(
                           angle: it.rotationDeg * 3.141592653589793 / 180,
