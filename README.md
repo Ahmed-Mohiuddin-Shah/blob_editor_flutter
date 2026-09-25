@@ -1,8 +1,9 @@
 # blob_editor
 
-Flutter / Dart package for **BLOB Composition** — same JSON document contract (**v2**) as the npm `blob-editor` package. Drop-in `BlobEditor` widget with built-in media pick.
+Flutter / Dart package for **BLOB Composition** — same JSON document contract (**v2**) as the npm `blob-editor` package — plus sibling **`PrintLayout`** for printable sticker sheets. Drop-in `BlobEditor` widget with built-in media pick.
 
-**UI only for animated output:** `onExport` returns document + still PNGs (+ optional mask). Host POSTs to server; Node worker runs `blob-editor/encode` → gif/mp4. See [`docs/diff.md`](../docs/diff.md).
+**UI only for animated output:** `onExport` returns document + still PNGs (+ optional mask). Host POSTs to server; Node worker runs `blob-editor/encode` → gif/mp4. See [`docs/diff.md`](../docs/diff.md).  
+**Print / packs:** [`docs/print-layout-host.md`](../docs/print-layout-host.md).
 
 ## Requirements
 
@@ -97,3 +98,19 @@ validateDocument(doc.toJson());
 ## Document sketch
 
 `version: 2`, snake_case JSON (`scale_x`, `asset_id`, `start_ms`, …). Full field map in `docs/diff.md`.
+
+## Print layout
+
+```dart
+PrintLayout(
+  assets: [PrintAssetMeta(id: 's1', label: 'Cat')],
+  resolveAsset: (id) async => /* decode sticker full PNG */,
+  onExport: (PrintExportPayload p) {
+    // p.document.toJson() — PrintDocument v1 (mm page)
+    // p.previewPng — sheet preview; PDF via Node encodePrint
+  },
+)
+```
+
+Core helpers: `pageA4`, `layoutGrid`, `validatePrintDocument`, `renderPrintPng`.  
+Example app starts with a chooser: **Composition** vs **Print layout**.

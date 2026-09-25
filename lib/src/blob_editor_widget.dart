@@ -526,7 +526,9 @@ class _BlobEditorState extends State<BlobEditor> {
   void _setMaskMode(String? mode) {
     setState(() {
       _polygonPoints.clear();
-      _brushCursor = null;
+      _brushCursor = (mode == 'add' || mode == 'remove')
+          ? const Offset(canvasSize / 2, canvasSize / 2)
+          : null;
       _maskMode = mode;
     });
   }
@@ -1348,11 +1350,33 @@ class _BlobEditorState extends State<BlobEditor> {
               'Brush size ${_brushSize.round()}',
               style: TextStyle(fontSize: 12, color: chrome.muted),
             ),
-            Slider(
-              min: 8,
-              max: 64,
-              value: _brushSize.clamp(8, 64),
-              onChanged: (v) => setState(() => _brushSize = v),
+            Row(
+              children: [
+                // Size preview: diameter tracks slider (8–64) in a fixed box.
+                SizedBox(
+                  width: 72,
+                  height: 72,
+                  child: CustomPaint(
+                    painter: _BrushSizePreviewPainter(
+                      diameter: _brushSize.clamp(8, 64),
+                      color: widget.primary,
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: Slider(
+                    min: 8,
+                    max: 64,
+                    value: _brushSize.clamp(8, 64),
+                    onChanged: (v) => setState(() {
+                      _brushSize = v;
+                      // Keep a stage ring visible while dragging (touch has no hover).
+                      _brushCursor ??=
+                          const Offset(canvasSize / 2, canvasSize / 2);
+                    }),
+                  ),
+                ),
+              ],
             ),
           ],
           if (_maskMode == 'polygon')
@@ -1655,6 +1679,38 @@ class _ToolPanel extends StatelessWidget {
       ),
     );
   }
+}
+
+class _BrushSizePreviewPainter extends CustomPainter {
+  _BrushSizePreviewPainter({required this.diameter, required this.color});
+
+  final double diameter;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = Offset(size.width / 2, size.height / 2);
+    final r = (diameter / 2).clamp(1.0, math.min(size.width, size.height) / 2);
+    canvas.drawCircle(
+      c,
+      r,
+      Paint()
+        ..color = color.withValues(alpha: 0.15)
+        ..style = PaintingStyle.fill,
+    );
+    canvas.drawCircle(
+      c,
+      r,
+      Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _BrushSizePreviewPainter old) =>
+      old.diameter != diameter || old.color != color;
 }
 
 class _CompositionPainter extends CustomPainter {
