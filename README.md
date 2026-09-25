@@ -1,18 +1,26 @@
 # blob_editor
 
-Flutter / Dart package for **BLOB Composition** — same JSON document contract (**v2**) as the npm `blob-editor` package — plus sibling **`PrintLayout`** for printable sticker sheets. Drop-in `BlobEditor` widget with built-in media pick.
+Flutter / Dart package for **BLOB Composition** — same JSON document contract (**v2**) as the npm [`blob-editor`](https://www.npmjs.com/package/blob-editor) package — plus sibling **`PrintLayout`** for printable sticker sheets. Drop-in `BlobEditor` widget with built-in media pick.
 
-**UI only for animated output:** `onExport` returns document + still PNGs (+ optional mask). Host POSTs to server; Node worker runs `blob-editor/encode` → gif/mp4. See [`docs/diff.md`](../docs/diff.md).  
-**Print / packs:** [`docs/print-layout-host.md`](../docs/print-layout-host.md).
+**UI only for animated output:** `onExport` returns document + still PNGs (+ optional mask). Host POSTs to server; Node worker runs `blob-editor/encode` → gif/mp4.
 
-## Requirements
+| Platform | Support |
+|----------|---------|
+| Android | API 21+ (primary) |
+| iOS | Scaffold present; not maintained this release |
 
-| Tool | Pin / note |
-|------|------------|
-| Flutter | **3.47.x** (stable; package developed on 3.47.5) |
-| Dart | **3.13.x** (`sdk: ^3.13.4`) |
-| Android | API 21+; gallery permissions below |
-| iOS | Folder may exist; **not maintained** this pass |
+## Install
+
+```yaml
+dependencies:
+  blob_editor: ^0.1.0
+```
+
+```bash
+flutter pub add blob_editor
+```
+
+Requires Flutter **3.47.x** / Dart **3.13.x**.
 
 ## Drop-in usage
 
@@ -97,7 +105,7 @@ validateDocument(doc.toJson());
 
 ## Document sketch
 
-`version: 2`, snake_case JSON (`scale_x`, `asset_id`, `start_ms`, …). Full field map in `docs/diff.md`.
+`version: 2`, snake_case JSON (`scale_x`, `asset_id`, `start_ms`, …). Canvas 1024²; objects carry media `kind` / single `keep` trim / `mask_asset_id` / `outline`.
 
 ## Print layout
 
@@ -112,5 +120,8 @@ PrintLayout(
 )
 ```
 
-Core helpers: `pageA4`, `layoutGrid`, `validatePrintDocument`, `renderPrintPng`.  
-Example app starts with a chooser: **Composition** vs **Print layout**.
+Core helpers: `pageA4`, `layoutGrid`, `validatePrintDocument`, `renderPrintPng`.
+
+## License
+
+MIT

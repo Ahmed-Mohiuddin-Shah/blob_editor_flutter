@@ -29,3 +29,8 @@ migrate_working_dir/
 .flutter-plugins-dependencies
 /build/
 /coverage/
+
+# Example app local build output
+example/**/build/
+example/.dart_tool/
+example/.flutter-plugins-dependencies
