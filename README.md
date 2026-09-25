@@ -1,6 +1,8 @@
 # blob_editor
 
-Flutter / Dart package for **BLOB Composition** — same JSON document contract as the npm `blob-editor` package. Drop-in `BlobEditor` widget with built-in gallery pick.
+Flutter / Dart package for **BLOB Composition** — same JSON document contract (**v2**) as the npm `blob-editor` package. Drop-in `BlobEditor` widget with built-in media pick.
+
+**UI only for animated output:** `onExport` returns document + still PNGs. Host POSTs to server; Node worker runs `blob-editor/encode` → gif/mp4. See [`docs/diff.md`](../docs/diff.md).
 
 ## Requirements
 
@@ -17,18 +19,21 @@ Flutter / Dart package for **BLOB Composition** — same JSON document contract 
 import 'package:blob_editor/blob_editor.dart';
 
 BlobEditor(
-  // omit sourceAsset → ImagePicker gallery
   primary: Color(0xFFF10EA0),
   secondary: Color(0xFFE95214),
   onPrimary: Colors.white,
   onSecondary: Colors.white,
-  blocky: false, // true = sharp corners; false = Blobby soft radii
-  themeMode: BlobThemeMode.system, // light | dark | system
+  blocky: false,
+  themeMode: BlobThemeMode.system,
   onCancel: () {},
+  onRemoveBackground: (assetId) async {
+    // host/worker segmentation → mask PNG bytes (or null to cancel)
+    return null;
+  },
   onExport: (ExportPayload p) {
-    // p.document — versioned Composition JSON
-    // p.chat (128), p.thumbnail (256), p.full (1024) — PNG Uint8List
-    // host uploads / persists; editor does not talk to BLOB/GLASS
+    // p.document — Composition JSON v2
+    // p.chat / thumbnail / full — still PNG Uint8List
+    // upload document + assets; server encodes gif/video
   },
 )
 ```
@@ -37,61 +42,40 @@ BlobEditor(
 
 | Prop | Meaning |
 |------|---------|
-| `sourceAsset?` | `ImageProvider`. If omitted (and no usable `document` media), opens gallery. |
-| `document?` | Initial composition JSON `Map` (edit / remix). |
+| `sourceAsset?` | `ImageProvider`. If omitted, opens media picker. |
+| `document?` | Initial composition JSON `Map` (edit / remix); v1 migrates. |
 | `primary` / `onPrimary` / `secondary` / `onSecondary` | Theme colors |
-| `blocky` | `true` = sharp square chrome; `false` = Blobby soft radii |
-| `themeMode` | `BlobThemeMode.light` \| `.dark` \| `.system` (default). Frosted glass chrome. |
-| `onExport` | `ExportPayload` with `document` + `chat` / `thumbnail` / `full` |
+| `blocky` | `true` = sharp; `false` = Blobby soft radii |
+| `themeMode` | `BlobThemeMode.light` \| `.dark` \| `.system` |
+| `onRemoveBackground?` | Host cutout: `(assetId) → Future<Uint8List?>` |
+| `onExport` | `ExportPayload` with `document` + stills |
 | `onCancel?` | Dismiss without export |
+
+Kind-gated UI (image ⊃ gif ⊃ video): crop/scale/rotate/text/undo; BG + multi for image/gif; remove-BG/brush/outline for image; trim for gif/video; mute for video.
 
 ## Android permissions
 
-Host / example apps that use the built-in picker need:
-
 ```xml
 <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+<uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+<uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
 <uses-permission
     android:name="android.permission.READ_EXTERNAL_STORAGE"
     android:maxSdkVersion="32" />
 ```
-
-`image_picker` prompts at runtime on modern Android. See `example/android/app/src/main/AndroidManifest.xml`.
 
 ## Core (no UI)
 
 ```dart
 import 'package:blob_editor/blob_editor.dart';
 
-final doc = createFromSource('asset_1', 1920, 1080);
+final doc = createFromSource('asset_1', 1920, 1080, kind: MediaKind.video, durationMs: 5000);
 validateDocument(doc.toJson());
-final copy = remixDeepCopy(doc);
-// renderExports(doc, (id) => myUiImage);
 ```
 
 - `exportSizes`: `{ chat: 128, thumbnail: 256, full: 1024 }`
-- Preview ≡ export: one 1024 draw, then scale
-- Smart cutout hook: `applyMask(doc, id, maskAssetId)`
-
-## Text / meme font
-
-Default face is **Anton** via `google_fonts` (portable Impact stand-in). Add text → inspector for content, size, fill, outline. Drag/pinch still moves the selected layer.
-
-## Example (Android)
-
-```bash
-cd blob_editor_flutter
-flutter pub get
-cd example && flutter run
-```
-
-## Tests
-
-```bash
-flutter test
-flutter analyze
-```
+- `paintComposition(..., tMs:)` / `renderFrameImage` for timed preview
 
 ## Document sketch
 
-Same as `docs/blob-requirements.md` §7.1 / npm `blob-editor` — `version`, `canvas` 1024², `objects[]` media/text. JSON field names use snake_case (`scale_x`, `asset_id`, …).
+`version: 2`, snake_case JSON (`scale_x`, `asset_id`, `start_ms`, …). Full field map in `docs/diff.md`.

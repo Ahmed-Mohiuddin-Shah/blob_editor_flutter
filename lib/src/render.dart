@@ -46,21 +46,37 @@ void _drawMedia(Canvas canvas, MediaObject obj, AssetResolver resolver) {
   canvas.rotate(obj.transform.rotation * math.pi / 180);
   canvas.scale(obj.transform.scaleX, obj.transform.scaleY);
 
-  final maskId = obj.maskAssetId;
-  final mask = maskId != null ? resolver(maskId) : null;
-  if (mask != null) {
-    canvas.saveLayer(dst, Paint());
-    canvas.drawImageRect(image, src, dst, Paint());
-    canvas.drawImageRect(
-      mask,
-      Rect.fromLTWH(0, 0, mask.width.toDouble(), mask.height.toDouble()),
-      dst,
-      Paint()..blendMode = BlendMode.dstIn,
-    );
-    canvas.restore();
-  } else {
-    canvas.drawImageRect(image, src, dst, Paint());
+  void drawMasked() {
+    final maskId = obj.maskAssetId;
+    final mask = maskId != null ? resolver(maskId) : null;
+    if (mask != null) {
+      canvas.saveLayer(dst, Paint());
+      canvas.drawImageRect(image, src, dst, Paint());
+      canvas.drawImageRect(
+        mask,
+        Rect.fromLTWH(0, 0, mask.width.toDouble(), mask.height.toDouble()),
+        dst,
+        Paint()..blendMode = BlendMode.dstIn,
+      );
+      canvas.restore();
+    } else {
+      canvas.drawImageRect(image, src, dst, Paint());
+    }
   }
+
+  // ponytail: outline via blur+tint under content (ceiling: soft edge, not hard stroke)
+  final outline = obj.outline;
+  if (outline != null && outline.width > 0) {
+    final color = _parseColor(outline.color) ?? const Color(0xFFFFFFFF);
+    final w = outline.width;
+    canvas.saveLayer(dst.inflate(w + 4), Paint());
+    drawMasked();
+    canvas.drawPaint(Paint()
+      ..colorFilter = ColorFilter.mode(color, BlendMode.srcIn)
+      ..imageFilter = ui.ImageFilter.blur(sigmaX: w / 2, sigmaY: w / 2));
+    canvas.restore();
+  }
+  drawMasked();
   canvas.restore();
 }
 
@@ -136,12 +152,17 @@ void _drawText(Canvas canvas, TextObject obj) {
 void paintComposition(
   Canvas canvas,
   CompositionDocument doc,
-  AssetResolver resolver,
-) {
+  AssetResolver resolver, {
+  double tMs = 0,
+}) {
+  final t = doc.durationMs > 0 ? tMs : 0.0;
   _drawBackground(canvas, doc.canvas.background);
   for (final obj in doc.objects) {
     switch (obj) {
       case MediaObject():
+        if (obj.keep != null && mapCompToSource(obj.keep, t) == null) {
+          continue;
+        }
         _drawMedia(canvas, obj, resolver);
       case TextObject():
         _drawText(canvas, obj);
@@ -149,15 +170,23 @@ void paintComposition(
   }
 }
 
+Future<ui.Image> renderFrameImage(
+  CompositionDocument doc,
+  AssetResolver resolver,
+  double tMs,
+) async {
+  final recorder = ui.PictureRecorder();
+  final canvas = Canvas(recorder);
+  paintComposition(canvas, doc, resolver, tMs: tMs);
+  final picture = recorder.endRecording();
+  return picture.toImage(canvasSize, canvasSize);
+}
+
 Future<ui.Image> renderFullImage(
   CompositionDocument doc,
   AssetResolver resolver,
 ) async {
-  final recorder = ui.PictureRecorder();
-  final canvas = Canvas(recorder);
-  paintComposition(canvas, doc, resolver);
-  final picture = recorder.endRecording();
-  return picture.toImage(canvasSize, canvasSize);
+  return renderFrameImage(doc, resolver, 0);
 }
 
 Future<Uint8List> _imageToPng(ui.Image image) async {

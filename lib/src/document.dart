@@ -1,11 +1,30 @@
 import 'dart:typed_data';
 
-/// BLOB Composition document — mirrors TS `blob-editor` core.
+/// BLOB Composition document — mirrors TS `blob-editor` core (v2, simplified).
 
-const int documentVersion = 1;
+const int documentVersion = 2;
 const int canvasSize = 1024;
+const int maxDurationMs = 10000;
+const double defaultFpsGif = 15;
+const double defaultFpsVideo = 24;
 
 typedef Background = String; // "transparent" | "#RRGGBB"
+
+enum MediaKind { image, gif, video }
+
+extension MediaKindJson on MediaKind {
+  String get json => name;
+  static MediaKind parse(String? v) {
+    switch (v) {
+      case 'gif':
+        return MediaKind.gif;
+      case 'video':
+        return MediaKind.video;
+      default:
+        return MediaKind.image;
+    }
+  }
+}
 
 class Transform2D {
   const Transform2D({
@@ -20,8 +39,6 @@ class Transform2D {
   final double y;
   final double scaleX;
   final double scaleY;
-
-  /// Degrees, clockwise.
   final double rotation;
 
   Transform2D copyWith({
@@ -69,6 +86,14 @@ class CropRect {
   final double width;
   final double height;
 
+  CropRect copyWith({double? x, double? y, double? width, double? height}) =>
+      CropRect(
+        x: x ?? this.x,
+        y: y ?? this.y,
+        width: width ?? this.width,
+        height: height ?? this.height,
+      );
+
   Map<String, dynamic> toJson() => {
         'x': x,
         'y': y,
@@ -84,16 +109,45 @@ class CropRect {
       );
 }
 
-class Timing {
-  const Timing({required this.start, required this.end});
-  final double start;
-  final double end;
+class TimeRange {
+  const TimeRange({required this.startMs, required this.endMs});
+  final double startMs;
+  final double endMs;
 
-  Map<String, dynamic> toJson() => {'start': start, 'end': end};
+  double get durationMs => (endMs - startMs).clamp(0, double.infinity);
 
-  factory Timing.fromJson(Map<String, dynamic> j) => Timing(
-        start: (j['start'] as num).toDouble(),
-        end: (j['end'] as num).toDouble(),
+  Map<String, dynamic> toJson() => {'start_ms': startMs, 'end_ms': endMs};
+
+  factory TimeRange.fromJson(Map<String, dynamic> j) => TimeRange(
+        startMs: (j['start_ms'] as num).toDouble(),
+        endMs: (j['end_ms'] as num).toDouble(),
+      );
+}
+
+class OutlineStyle {
+  const OutlineStyle({required this.color, required this.width});
+  final String color;
+  final double width;
+
+  Map<String, dynamic> toJson() => {'color': color, 'width': width};
+
+  factory OutlineStyle.fromJson(Map<String, dynamic> j) => OutlineStyle(
+        color: j['color'] as String,
+        width: (j['width'] as num).toDouble(),
+      );
+}
+
+class AudioTrack {
+  const AudioTrack({required this.muteSource});
+  final bool muteSource;
+
+  AudioTrack copyWith({bool? muteSource}) =>
+      AudioTrack(muteSource: muteSource ?? this.muteSource);
+
+  Map<String, dynamic> toJson() => {'mute_source': muteSource};
+
+  factory AudioTrack.fromJson(Map<String, dynamic> j) => AudioTrack(
+        muteSource: j['mute_source'] as bool? ?? true,
       );
 }
 
@@ -107,34 +161,46 @@ class MediaObject implements CompositionObject {
   MediaObject({
     required this.id,
     required this.assetId,
+    required this.kind,
     required this.transform,
     this.crop,
     this.maskAssetId,
-    this.timing,
+    this.keep,
+    this.outline,
   });
 
   @override
   final String id;
   final String assetId;
+  final MediaKind kind;
   @override
   final Transform2D transform;
   final CropRect? crop;
   final String? maskAssetId;
-  final Timing? timing;
+  /// Single-range trim. null = full source.
+  final TimeRange? keep;
+  final OutlineStyle? outline;
 
   MediaObject copyWith({
     Transform2D? transform,
     CropRect? crop,
     String? maskAssetId,
     bool clearMask = false,
+    TimeRange? keep,
+    bool clearKeep = false,
+    OutlineStyle? outline,
+    bool clearOutline = false,
+    MediaKind? kind,
   }) =>
       MediaObject(
         id: id,
         assetId: assetId,
+        kind: kind ?? this.kind,
         transform: transform ?? this.transform,
         crop: crop ?? this.crop,
         maskAssetId: clearMask ? null : (maskAssetId ?? this.maskAssetId),
-        timing: timing,
+        keep: clearKeep ? null : (keep ?? this.keep),
+        outline: clearOutline ? null : (outline ?? this.outline),
       );
 
   @override
@@ -142,24 +208,57 @@ class MediaObject implements CompositionObject {
         'id': id,
         'type': 'media',
         'asset_id': assetId,
+        'kind': kind.json,
         'transform': transform.toJson(),
         'crop': crop?.toJson(),
         'mask_asset_id': maskAssetId,
-        'timing': timing?.toJson(),
+        'keep': keep?.toJson(),
+        'outline': outline?.toJson(),
       };
 
-  factory MediaObject.fromJson(Map<String, dynamic> j) => MediaObject(
-        id: j['id'] as String,
-        assetId: j['asset_id'] as String,
-        transform: Transform2D.fromJson(j['transform'] as Map<String, dynamic>),
-        crop: j['crop'] == null
-            ? null
-            : CropRect.fromJson(j['crop'] as Map<String, dynamic>),
-        maskAssetId: j['mask_asset_id'] as String?,
-        timing: j['timing'] == null
-            ? null
-            : Timing.fromJson(j['timing'] as Map<String, dynamic>),
-      );
+  factory MediaObject.fromJson(Map<String, dynamic> j) {
+    TimeRange? keep = _coerceKeep(j['keep']);
+    if (keep == null && j['timing'] is Map) {
+      final t = j['timing'] as Map<String, dynamic>;
+      var start = (t['start'] as num).toDouble();
+      var end = (t['end'] as num).toDouble();
+      if (end <= 120 && start < 120) {
+        start *= 1000;
+        end *= 1000;
+      }
+      if (end > start) keep = TimeRange(startMs: start, endMs: end);
+    }
+    return MediaObject(
+      id: j['id'] as String,
+      assetId: j['asset_id'] as String,
+      kind: MediaKindJson.parse(j['kind'] as String?),
+      transform: Transform2D.fromJson(j['transform'] as Map<String, dynamic>),
+      crop: j['crop'] == null
+          ? null
+          : CropRect.fromJson(j['crop'] as Map<String, dynamic>),
+      maskAssetId: j['mask_asset_id'] as String?,
+      keep: keep,
+      outline: j['outline'] == null
+          ? null
+          : OutlineStyle.fromJson(j['outline'] as Map<String, dynamic>),
+    );
+  }
+}
+
+TimeRange? _coerceKeep(dynamic raw) {
+  if (raw == null) return null;
+  if (raw is List) {
+    if (raw.isEmpty) return null;
+    final first = raw.first;
+    if (first is! Map) return null;
+    final r = TimeRange.fromJson(Map<String, dynamic>.from(first));
+    return r.endMs > r.startMs ? r : null;
+  }
+  if (raw is Map) {
+    final r = TimeRange.fromJson(Map<String, dynamic>.from(raw));
+    return r.endMs > r.startMs ? r : null;
+  }
+  return null;
 }
 
 class ObjectTextStyle {
@@ -284,29 +383,46 @@ class CompositionDocument {
     this.version = documentVersion,
     required this.canvas,
     required this.objects,
+    this.durationMs = 0,
+    this.fps = defaultFpsGif,
+    this.audio,
   });
 
   final int version;
   final CanvasSpec canvas;
   final List<CompositionObject> objects;
+  final double durationMs;
+  final double fps;
+  final AudioTrack? audio;
 
   CompositionDocument copyWith({
     CanvasSpec? canvas,
     List<CompositionObject>? objects,
+    double? durationMs,
+    double? fps,
+    AudioTrack? audio,
+    bool clearAudio = false,
   }) =>
       CompositionDocument(
         version: version,
         canvas: canvas ?? this.canvas,
         objects: objects ?? this.objects,
+        durationMs: durationMs ?? this.durationMs,
+        fps: fps ?? this.fps,
+        audio: clearAudio ? null : (audio ?? this.audio),
       );
 
   Map<String, dynamic> toJson() => {
         'version': version,
         'canvas': canvas.toJson(),
         'objects': objects.map((o) => o.toJson()).toList(),
+        'duration_ms': durationMs,
+        'fps': fps,
+        'audio': audio?.toJson(),
       };
 
   factory CompositionDocument.fromJson(Map<String, dynamic> j) {
+    final ver = j['version'] as int? ?? 1;
     final objs = (j['objects'] as List<dynamic>).map((raw) {
       final m = raw as Map<String, dynamic>;
       final type = m['type'] as String;
@@ -314,15 +430,25 @@ class CompositionDocument {
       if (type == 'text') return TextObject.fromJson(m);
       throw FormatException('unknown object type: $type');
     }).toList();
+
+    final medias = objs.whereType<MediaObject>();
+    final primary = medias.isEmpty ? null : medias.first;
+    AudioTrack? audio;
+    if (primary?.kind == MediaKind.video && j['audio'] is Map) {
+      audio = AudioTrack.fromJson(j['audio'] as Map<String, dynamic>);
+    }
+
     return CompositionDocument(
-      version: j['version'] as int,
+      version: ver == 1 ? documentVersion : ver,
       canvas: CanvasSpec.fromJson(j['canvas'] as Map<String, dynamic>),
       objects: objs,
+      durationMs: (j['duration_ms'] as num?)?.toDouble() ?? 0,
+      fps: (j['fps'] as num?)?.toDouble() ?? defaultFpsGif,
+      audio: audio,
     );
   }
 }
 
-/// Export payload — parity with TS `ExportPayload`.
 class ExportPayload {
   ExportPayload({
     required this.document,
@@ -347,4 +473,19 @@ class ExportPayload {
         'thumbnail': thumbnail,
         'full': full,
       };
+}
+
+double keepDurationMs(TimeRange? keep) {
+  if (keep == null) return 0;
+  return keep.durationMs;
+}
+
+/// @deprecated alias
+double keepTotalMs(TimeRange? keep) => keepDurationMs(keep);
+
+double? mapCompToSource(TimeRange? keep, double tMs) {
+  if (keep == null) return tMs;
+  final d = keep.durationMs;
+  if (tMs < 0 || tMs >= d) return null;
+  return keep.startMs + tMs;
 }
