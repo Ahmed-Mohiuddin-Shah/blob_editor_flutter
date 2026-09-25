@@ -332,14 +332,10 @@ class _HomeState extends State<_Home> {
     if (images == null) {
       return const Center(child: CircularProgressIndicator());
     }
+    // Portrait-locked chrome: no outer scroll — PrintLayout fills the viewport.
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Text(
-          'Add stickers · Auto grid · Export document + preview PNG',
-          style: TextStyle(color: dark ? Colors.white70 : Colors.black54),
-        ),
-        const SizedBox(height: 8),
         Expanded(
           child: PrintLayout(
             themeMode: widget.themeMode,
@@ -352,17 +348,23 @@ class _HomeState extends State<_Home> {
             onExport: (payload) {
               setState(() {
                 _log =
-                    'preview=${payload.previewPng.length}B\n'
-                    'items=${payload.document.items.length}\n'
-                    'page=${payload.document.page.widthMm}×${payload.document.page.heightMm}mm';
+                    'preview=${payload.previewPng.length}B · '
+                    'items=${payload.document.items.length} · '
+                    '${payload.document.page.widthMm}×${payload.document.page.heightMm}mm';
               });
             },
           ),
         ),
-        if (_log.isNotEmpty) ...[
-          const SizedBox(height: 8),
-          Text(_log, style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
-        ],
+        if (_log.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              _log,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+            ),
+          ),
       ],
     );
   }
