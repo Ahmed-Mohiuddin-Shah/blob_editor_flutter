@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -210,7 +211,91 @@ Future<Uint8List> _scalePng(ui.Image source, int size) async {
   return _imageToPng(scaled);
 }
 
-/// Preview ≡ export: one full render, then scale.
+/// Bake primary media alpha into a mask PNG when cutout/outline present.
+Future<Uint8List?> renderMaskPng(
+  CompositionDocument doc,
+  AssetResolver resolver,
+) async {
+  MediaObject? media;
+  for (final o in doc.objects) {
+    if (o is MediaObject) {
+      media = o;
+      break;
+    }
+  }
+  if (media == null || (media.maskAssetId == null && media.outline == null)) {
+    return null;
+  }
+  final image = resolver(media.assetId);
+  if (image == null) return null;
+
+  final crop = media.crop;
+  final sw = math.max(1, (crop?.width ?? image.width.toDouble()).round());
+  final sh = math.max(1, (crop?.height ?? image.height.toDouble()).round());
+  final sx = crop?.x ?? 0.0;
+  final sy = crop?.y ?? 0.0;
+  final src = Rect.fromLTWH(sx, sy, sw.toDouble(), sh.toDouble());
+  final dst = Rect.fromLTWH(0, 0, sw.toDouble(), sh.toDouble());
+
+  final recorder = ui.PictureRecorder();
+  final canvas = Canvas(recorder);
+
+  void drawMasked() {
+    final maskId = media!.maskAssetId;
+    final mask = maskId != null ? resolver(maskId) : null;
+    if (mask != null) {
+      canvas.saveLayer(dst, Paint());
+      canvas.drawImageRect(image, src, dst, Paint());
+      canvas.drawImageRect(
+        mask,
+        Rect.fromLTWH(0, 0, mask.width.toDouble(), mask.height.toDouble()),
+        dst,
+        Paint()..blendMode = BlendMode.dstIn,
+      );
+      canvas.restore();
+    } else {
+      canvas.drawImageRect(image, src, dst, Paint());
+    }
+  }
+
+  final outline = media.outline;
+  if (outline != null && outline.width > 0) {
+    final color = _parseColor(outline.color) ?? const Color(0xFFFFFFFF);
+    final w = outline.width;
+    canvas.saveLayer(dst.inflate(w + 4), Paint());
+    drawMasked();
+    canvas.drawPaint(Paint()
+      ..colorFilter = ColorFilter.mode(color, BlendMode.srcIn)
+      ..imageFilter = ui.ImageFilter.blur(sigmaX: w / 2, sigmaY: w / 2));
+    canvas.restore();
+  }
+  drawMasked();
+
+  final picture = recorder.endRecording();
+  final layer = await picture.toImage(sw, sh);
+  final bd = await layer.toByteData(format: ui.ImageByteFormat.rawRgba);
+  if (bd == null) return null;
+  final px = bd.buffer.asUint8List();
+  for (var i = 0; i < px.length; i += 4) {
+    final a = px[i + 3];
+    px[i] = a;
+    px[i + 1] = a;
+    px[i + 2] = a;
+    px[i + 3] = 255;
+  }
+  final completer = Completer<ui.Image>();
+  ui.decodeImageFromPixels(
+    px,
+    sw,
+    sh,
+    ui.PixelFormat.rgba8888,
+    completer.complete,
+  );
+  final gray = await completer.future;
+  return _imageToPng(gray);
+}
+
+/// Preview ≡ export: one full render, then scale. Optional mask when cutout used.
 Future<ExportPayload> renderExports(
   CompositionDocument doc,
   AssetResolver resolver,
@@ -219,11 +304,13 @@ Future<ExportPayload> renderExports(
   final chat = await _scalePng(fullImg, exportSizes['chat']!);
   final thumbnail = await _scalePng(fullImg, exportSizes['thumbnail']!);
   final full = await _scalePng(fullImg, exportSizes['full']!);
+  final mask = await renderMaskPng(doc, resolver);
   return ExportPayload(
     document: doc,
     chat: chat,
     thumbnail: thumbnail,
     full: full,
+    mask: mask,
     background: doc.canvas.background,
   );
 }

@@ -166,6 +166,7 @@ class _HomeState extends State<_Home> {
               'chat=${payload.chat.length}B\n'
               'thumbnail=${payload.thumbnail.length}B\n'
               'full=${payload.full.length}B\n'
+              'mask=${payload.mask?.length ?? 0}B\n'
               'objects=${payload.document.objects.length}';
         });
       },

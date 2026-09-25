@@ -2,7 +2,7 @@
 
 Flutter / Dart package for **BLOB Composition** — same JSON document contract (**v2**) as the npm `blob-editor` package. Drop-in `BlobEditor` widget with built-in media pick.
 
-**UI only for animated output:** `onExport` returns document + still PNGs. Host POSTs to server; Node worker runs `blob-editor/encode` → gif/mp4. See [`docs/diff.md`](../docs/diff.md).
+**UI only for animated output:** `onExport` returns document + still PNGs (+ optional mask). Host POSTs to server; Node worker runs `blob-editor/encode` → gif/mp4. See [`docs/diff.md`](../docs/diff.md).
 
 ## Requirements
 
@@ -26,13 +26,10 @@ BlobEditor(
   blocky: false,
   themeMode: BlobThemeMode.system,
   onCancel: () {},
-  onRemoveBackground: (assetId) async {
-    // host/worker segmentation → mask PNG bytes (or null to cancel)
-    return null;
-  },
   onExport: (ExportPayload p) {
     // p.document — Composition JSON v2
     // p.chat / thumbnail / full — still PNG Uint8List
+    // p.mask — baked cutout alpha when brush/polygon/outline used
     // upload document + assets; server encodes gif/video
   },
 )
@@ -47,11 +44,31 @@ BlobEditor(
 | `primary` / `onPrimary` / `secondary` / `onSecondary` | Theme colors |
 | `blocky` | `true` = sharp; `false` = Blobby soft radii |
 | `themeMode` | `BlobThemeMode.light` \| `.dark` \| `.system` |
-| `onRemoveBackground?` | Host cutout: `(assetId) → Future<Uint8List?>` |
-| `onExport` | `ExportPayload` with `document` + stills |
+| `onExport` | `ExportPayload` with `document` + stills + optional `mask` |
 | `onCancel?` | Dismiss without export |
 
-Kind-gated UI (image ⊃ gif ⊃ video): crop/scale/rotate/text/undo; BG + multi for image/gif; remove-BG/brush/outline for image; trim for gif/video; mute for video.
+Kind-gated UI (image ⊃ gif ⊃ video): crop/scale/rotate/text/undo; BG + multi for image/gif; **brush + polygon mask + outline** for image; trim for gif/video; mute for video.
+
+### Cutout (images)
+
+- **Brush add / remove** — paint keep/cut alpha on the stage (precise cursor; pan disabled while active). Brush size slider 8–64 (default 28).
+- **Polygon** — tap ≥3 points (auto-closes), then **Apply mask** to intersect the keep region with any existing mask.
+- **Apply mask** — commits the live brush/polygon session and exits the tool. Esc cancels in-progress polygon points.
+- **Clear mask** — drops `mask_asset_id`.
+- **White sticker border** — optional outline with width slider (2–32).
+
+Stage composites the same mask as export previews (`dstIn`). No in-package ML / auto remove-BG.
+
+### Layout
+
+Chrome: **header** (Cancel / Undo / Redo / Export) + **tool categories** with a **collapsible submenu**.
+
+Categories (kind / selection gated): Transform · Crop · Cutout · Text · Canvas.
+
+- **Narrow** (&lt;720px **or** unbounded height): previews → stage → timeline (if animated) → submenu panel → bottom category nav.
+- **Wide** (≥720px **and** bounded height from host, e.g. `Expanded`): tool nav + panel left \| stage + timeline center \| previews right.
+
+Timeline sits under the stage when `duration_ms > 0`, not inside the submenu. Put `BlobEditor` in an `Expanded` (or other bounded-height host) to enable the wide layout — a `ListView` host stays narrow even on wide tablets.
 
 ## Android permissions
 
@@ -75,6 +92,7 @@ validateDocument(doc.toJson());
 
 - `exportSizes`: `{ chat: 128, thumbnail: 256, full: 1024 }`
 - `paintComposition(..., tMs:)` / `renderFrameImage` for timed preview
+- `renderMaskPng` / `renderExports` — stills + optional mask PNG
 
 ## Document sketch
 

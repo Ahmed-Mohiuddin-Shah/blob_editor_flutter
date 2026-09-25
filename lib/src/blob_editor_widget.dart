@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
 
@@ -17,6 +17,16 @@ import 'video_poster.dart';
 const _kPrimary = Color(0xFFF10EA0);
 const _kSecondary = Color(0xFFE95214);
 
+enum _ToolId { transform, crop, cutout, text, canvas }
+
+const _toolTitles = {
+  _ToolId.transform: 'Transform',
+  _ToolId.crop: 'Crop',
+  _ToolId.cutout: 'Cutout',
+  _ToolId.text: 'Text',
+  _ToolId.canvas: 'Canvas',
+};
+
 /// Drop-in BLOB composition editor. Picks from gallery when no [sourceAsset].
 class BlobEditor extends StatefulWidget {
   const BlobEditor({
@@ -29,7 +39,6 @@ class BlobEditor extends StatefulWidget {
     this.onSecondary = Colors.white,
     this.blocky = false,
     this.themeMode = BlobThemeMode.system,
-    this.onRemoveBackground,
     required this.onExport,
     this.onCancel,
   });
@@ -50,9 +59,6 @@ class BlobEditor extends StatefulWidget {
 
   /// light | dark | system (follow platform). Default: system.
   final BlobThemeMode themeMode;
-
-  /// Host/worker subject segmentation → mask PNG bytes, or null to cancel.
-  final Future<Uint8List?> Function(String assetId)? onRemoveBackground;
 
   final void Function(ExportPayload payload) onExport;
   final VoidCallback? onCancel;
@@ -87,8 +93,12 @@ class _BlobEditorState extends State<BlobEditor> {
   /// Bumps when scrub frame bitmap changes — stage listens without full rebuild.
   final ValueNotifier<int> _frameTick = ValueNotifier(0);
   final ValueNotifier<double> _playheadTick = ValueNotifier(0);
-  String? _brushMode; // 'add' | 'remove'
-  bool _removingBg = false;
+  /// Cutout tool: add | remove | polygon.
+  String? _maskMode;
+  double _brushSize = 28;
+  final List<Offset> _polygonPoints = [];
+  Offset? _brushCursor;
+  _ToolId? _activeTool = _ToolId.text;
   Offset? _lastFocal;
   double _baseScale = 1;
   double _baseRotation = 0;
@@ -411,23 +421,7 @@ class _BlobEditorState extends State<BlobEditor> {
     }
   }
 
-  Future<void> _removeBackground(MediaObject media) async {
-    final cb = widget.onRemoveBackground;
-    if (cb == null || _doc == null) return;
-    setState(() => _removingBg = true);
-    try {
-      final bytes = await cb(media.assetId);
-      if (bytes == null || !mounted) return;
-      final maskId = media.maskAssetId ?? newObjectId('mask');
-      final image = await _decodeProvider(MemoryImage(bytes));
-      setState(() => _images[maskId] = image);
-      _push(applyMask(_doc!, media.id, maskId));
-    } finally {
-      if (mounted) setState(() => _removingBg = false);
-    }
-  }
-
-  /// ponytail: soft-circle brush into mask bitmap (images only).
+  /// Crop-aware soft circle into mask; stage + render share the same mask asset.
   Future<void> _paintBrush(MediaObject media, Offset canvasPt, String mode) async {
     final src = _images[media.assetId];
     if (src == null || _doc == null) return;
@@ -435,6 +429,11 @@ class _BlobEditorState extends State<BlobEditor> {
     final nh = src.height;
     final maskId = media.maskAssetId ?? newObjectId('mask');
     final existing = _images[maskId];
+    final crop = media.crop;
+    final iw = crop?.width ?? nw.toDouble();
+    final ih = crop?.height ?? nh.toDouble();
+    final sx = crop?.x ?? 0.0;
+    final sy = crop?.y ?? 0.0;
 
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder);
@@ -446,9 +445,15 @@ class _BlobEditorState extends State<BlobEditor> {
         Paint()..color = const Color(0xFFFFFFFF),
       );
     }
-    final lx = (canvasPt.dx - media.transform.x) / media.transform.scaleX + nw / 2;
-    final ly = (canvasPt.dy - media.transform.y) / media.transform.scaleY + nh / 2;
-    final r = 28 / math.max(media.transform.scaleX, 0.01);
+    final lx =
+        (canvasPt.dx - media.transform.x) / math.max(media.transform.scaleX, 0.01) +
+            iw / 2 +
+            sx;
+    final ly =
+        (canvasPt.dy - media.transform.y) / math.max(media.transform.scaleY, 0.01) +
+            ih / 2 +
+            sy;
+    final r = _brushSize / math.max(media.transform.scaleX, 0.01);
     canvas.drawCircle(
       Offset(lx, ly),
       r,
@@ -460,6 +465,97 @@ class _BlobEditorState extends State<BlobEditor> {
     final painted = await picture.toImage(nw, nh);
     setState(() => _images[maskId] = painted);
     _live(applyMask(_doc!, media.id, maskId));
+  }
+
+  Future<bool> _applyPolygonMask(MediaObject media, List<Offset> points) async {
+    if (points.length < 3 || _doc == null) return false;
+    final src = _images[media.assetId];
+    if (src == null) return false;
+    final nw = src.width;
+    final nh = src.height;
+    final maskId = media.maskAssetId ?? newObjectId('mask');
+    final crop = media.crop;
+    final iw = crop?.width ?? nw.toDouble();
+    final ih = crop?.height ?? nh.toDouble();
+    final sx = crop?.x ?? 0.0;
+    final sy = crop?.y ?? 0.0;
+
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    final existing = _images[maskId];
+    if (existing != null) {
+      canvas.drawImage(existing, Offset.zero, Paint());
+    } else {
+      canvas.drawRect(
+        Rect.fromLTWH(0, 0, nw.toDouble(), nh.toDouble()),
+        Paint()..color = const Color(0xFFFFFFFF),
+      );
+    }
+
+    final polyRec = ui.PictureRecorder();
+    final polyCanvas = Canvas(polyRec);
+    final path = Path();
+    for (var i = 0; i < points.length; i++) {
+      final lx =
+          (points[i].dx - media.transform.x) / math.max(media.transform.scaleX, 0.01) +
+              iw / 2 +
+              sx;
+      final ly =
+          (points[i].dy - media.transform.y) / math.max(media.transform.scaleY, 0.01) +
+              ih / 2 +
+              sy;
+      if (i == 0) {
+        path.moveTo(lx, ly);
+      } else {
+        path.lineTo(lx, ly);
+      }
+    }
+    path.close();
+    polyCanvas.drawPath(path, Paint()..color = const Color(0xFFFFFFFF));
+    final polyPic = polyRec.endRecording();
+    final polyImg = await polyPic.toImage(nw, nh);
+    canvas.drawImage(polyImg, Offset.zero, Paint()..blendMode = BlendMode.dstIn);
+
+    final picture = recorder.endRecording();
+    final painted = await picture.toImage(nw, nh);
+    setState(() => _images[maskId] = painted);
+    _live(applyMask(_doc!, media.id, maskId));
+    return true;
+  }
+
+  void _setMaskMode(String? mode) {
+    setState(() {
+      _polygonPoints.clear();
+      _brushCursor = null;
+      _maskMode = mode;
+    });
+  }
+
+  Future<void> _handleApplyMask() async {
+    final live = _liveDoc.value ?? _doc;
+    if (live == null) return;
+    final sel = _selectedObject(live);
+    if (sel is MediaObject &&
+        sel.kind == MediaKind.image &&
+        _maskMode == 'polygon') {
+      if (_polygonPoints.length < 3) return;
+      final ok = await _applyPolygonMask(sel, List.of(_polygonPoints));
+      if (!ok) return;
+    }
+    setState(() {
+      _polygonPoints.clear();
+      _maskMode = null;
+      _brushCursor = null;
+    });
+    _commitPreview();
+  }
+
+  void _cancelPolygon() {
+    setState(() {
+      _polygonPoints.clear();
+      _maskMode = null;
+      _brushCursor = null;
+    });
   }
 
   void _push(CompositionDocument next, {bool preview = true}) {
@@ -499,6 +595,33 @@ class _BlobEditorState extends State<BlobEditor> {
     } finally {
       if (mounted) setState(() => _exporting = false);
     }
+  }
+
+  Map<_ToolId, bool> _toolsAvailable(CompositionDocument doc) {
+    final sel = _selectedObject(doc);
+    final selMedia = sel is MediaObject ? sel : null;
+    return {
+      _ToolId.transform: sel != null,
+      _ToolId.crop: selMedia != null,
+      _ToolId.cutout: selMedia?.kind == MediaKind.image,
+      _ToolId.text: true,
+      _ToolId.canvas: true,
+    };
+  }
+
+  _ToolId? _resolvedActiveTool(CompositionDocument doc) {
+    final avail = _toolsAvailable(doc);
+    if (_activeTool != null && avail[_activeTool] == true) return _activeTool;
+    final sel = _selectedObject(doc);
+    if (sel is TextObject) return _ToolId.text;
+    if (sel != null && avail[_ToolId.transform] == true) {
+      return _ToolId.transform;
+    }
+    return _ToolId.text;
+  }
+
+  void _selectTool(_ToolId id) {
+    setState(() => _activeTool = _activeTool == id ? null : id);
   }
 
   @override
@@ -560,103 +683,180 @@ class _BlobEditorState extends State<BlobEditor> {
                 int.parse(doc.canvas.background.substring(1), radix: 16),
           );
 
-    return BlobGlass(
-      colors: chrome,
-      borderRadius: _radius,
-      padding: const EdgeInsets.all(12),
-      child: DefaultTextStyle(
-        style: TextStyle(color: chrome.foreground),
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            // Wide multi-column only when height is bounded (Expanded host).
-            // Portrait tablet in a ListView is wide but unbounded → IntrinsicHeight
-            // + nested LayoutBuilder asserts during layout.
-            final wide =
-                constraints.maxWidth >= 720 && constraints.hasBoundedHeight;
-            final double stageSide;
-            if (wide) {
-              final centerW = constraints.maxWidth - 168 - 140 - 24;
-              stageSide = math.min(
-                560,
-                math.min(centerW.clamp(120, 560), constraints.maxHeight),
-              );
-            } else {
-              stageSide = math.min(
-                constraints.maxWidth.isFinite ? constraints.maxWidth : 320,
-                560,
-              );
-            }
-            final stage = _buildStage(doc, bgColor, side: stageSide);
-            final controls = _buildControls(doc, chrome);
-            final previews = _PreviewRow(
-              doc: _previewDoc ?? doc,
-              images: Map.of(_images),
-              axis: wide ? Axis.vertical : Axis.horizontal,
-            );
-            final toolbar = _buildToolbar(doc, chrome);
+    final avail = _toolsAvailable(doc);
+    // Collapsed (null) stays collapsed; only remap when active becomes invalid.
+    final active = _activeTool == null
+        ? null
+        : (_activeTool != null && avail[_activeTool] == true
+            ? _activeTool
+            : _resolvedActiveTool(doc));
 
-            if (!wide) {
-              return Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  stage,
-                  if (controls != null) ...[
-                    const SizedBox(height: 8),
-                    controls,
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.escape): () {
+          if (_maskMode == 'polygon') _cancelPolygon();
+        },
+      },
+      child: Focus(
+        autofocus: true,
+        child: BlobGlass(
+          colors: chrome,
+          borderRadius: _radius,
+          padding: const EdgeInsets.all(12),
+          child: DefaultTextStyle(
+            style: TextStyle(color: chrome.foreground),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                // Wide multi-column only when height is bounded (Expanded host).
+                // Portrait tablet in a ListView is wide but unbounded → stay narrow.
+                final wide = constraints.maxWidth >= 720 &&
+                    constraints.hasBoundedHeight;
+                final double stageSide;
+                if (wide) {
+                  final centerW = constraints.maxWidth - 260 - 140 - 24;
+                  stageSide = math.min(
+                    560,
+                    math.min(centerW.clamp(120, 560), constraints.maxHeight - 80),
+                  );
+                } else {
+                  stageSide = math.min(
+                    constraints.maxWidth.isFinite
+                        ? constraints.maxWidth
+                        : 320,
+                    560,
+                  );
+                }
+                final stage = _buildStage(doc, bgColor, side: stageSide);
+                final timeline = _buildTimeline(doc, chrome);
+                final panel = _buildToolPanel(doc, chrome, active);
+                final nav = _ToolNav(
+                  tools: [
+                    for (final id in _ToolId.values)
+                      if (avail[id] == true)
+                        (id: id, label: _toolTitles[id]!),
                   ],
-                  const SizedBox(height: 8),
-                  previews,
-                  const SizedBox(height: 8),
-                  toolbar,
-                ],
-              );
-            }
+                  active: active,
+                  onSelect: _selectTool,
+                  vertical: wide,
+                  chrome: chrome,
+                  pill: _pill,
+                  primary: widget.primary,
+                  onPrimary: widget.onPrimary,
+                );
+                final previews = _PreviewRow(
+                  doc: _previewDoc ?? doc,
+                  images: Map.of(_images),
+                  axis: wide ? Axis.vertical : Axis.horizontal,
+                );
+                final header = _buildHeader(chrome);
 
-            final row = Row(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                SizedBox(
-                  width: 168,
-                  child: SingleChildScrollView(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        if (controls != null) ...[
-                          controls,
-                          const SizedBox(height: 8),
-                        ],
-                        toolbar,
+                if (!wide) {
+                  return Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      header,
+                      const SizedBox(height: 8),
+                      previews,
+                      const SizedBox(height: 8),
+                      stage,
+                      if (timeline != null) ...[
+                        const SizedBox(height: 8),
+                        timeline,
                       ],
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Center(
-                    child: SizedBox(
-                      width: stageSide,
-                      height: stageSide,
-                      child: stage,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                SizedBox(
-                  width: 140,
-                  child: SingleChildScrollView(child: previews),
-                ),
-              ],
-            );
+                      if (panel != null) ...[
+                        const SizedBox(height: 8),
+                        panel,
+                      ],
+                      const SizedBox(height: 8),
+                      nav,
+                    ],
+                  );
+                }
 
-            return SizedBox(height: constraints.maxHeight, child: row);
-          },
+                final tools = Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    nav,
+                    if (panel != null) ...[
+                      const SizedBox(width: 8),
+                      Expanded(child: panel),
+                    ],
+                  ],
+                );
+
+                return SizedBox(
+                  height: constraints.maxHeight,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      header,
+                      const SizedBox(height: 8),
+                      Expanded(
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            SizedBox(
+                              width: 260,
+                              child: SingleChildScrollView(child: tools),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  SizedBox(
+                                    width: stageSide,
+                                    height: stageSide,
+                                    child: stage,
+                                  ),
+                                  if (timeline != null) ...[
+                                    const SizedBox(height: 8),
+                                    timeline,
+                                  ],
+                                ],
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            SizedBox(
+                              width: 140,
+                              child: SingleChildScrollView(child: previews),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
         ),
       ),
     );
   }
 
+  Widget _buildHeader(BlobChromeColors chrome) {
+    return Row(
+      children: [
+        if (widget.onCancel != null)
+          _chip('Cancel', widget.onCancel, chrome, ghost: true),
+        _chip('Undo', _past.isNotEmpty ? _undo : null, chrome),
+        _chip('Redo', _future.isNotEmpty ? _redo : null, chrome),
+        const Spacer(),
+        FilledButton(
+          style: _filledStyle(),
+          onPressed: _exporting ? null : _doExport,
+          child: Text(_exporting ? 'Export…' : 'Export'),
+        ),
+      ],
+    );
+  }
+
   Widget _buildStage(CompositionDocument doc, Color bgColor, {required double side}) {
     final viewScale = side / canvasSize;
+    final masking = _maskMode != null;
+    final brushing = _maskMode == 'add' || _maskMode == 'remove';
+
     return SizedBox(
       width: side,
       height: side,
@@ -665,106 +865,138 @@ class _BlobEditorState extends State<BlobEditor> {
             widget.blocky ? BorderRadius.zero : BorderRadius.circular(8),
         child: ColoredBox(
           color: bgColor,
-          child: GestureDetector(
-            onScaleStart: (d) {
-              final live = _liveDoc.value ?? doc;
-              if (_brushMode != null) {
-                final sel = _selectedObject(live);
-                if (sel is MediaObject && sel.kind == MediaKind.image) {
-                  final canvasPt = Offset(
-                    d.localFocalPoint.dx / viewScale,
-                    d.localFocalPoint.dy / viewScale,
-                  );
-                  unawaited(_paintBrush(sel, canvasPt, _brushMode!));
-                }
-                return;
-              }
-              _gestureStart = live;
-              _lastFocal = d.localFocalPoint;
-              // Prefer existing selection; else hit-test; else first media.
-              var id = _selectedId;
-              id ??= _hitTest(live, d.localFocalPoint, viewScale);
-              if (id == null) {
-                final media = live.objects.whereType<MediaObject>();
-                if (media.isNotEmpty) id = media.first.id;
-              }
-              _selectedId = id;
-              CompositionObject? obj;
-              for (final o in live.objects) {
-                if (o.id == id) obj = o;
-              }
-              if (obj != null) {
-                _baseScale = obj.transform.scaleX;
-                _baseRotation = obj.transform.rotation;
-              }
+          child: MouseRegion(
+            cursor: masking ? SystemMouseCursors.precise : SystemMouseCursors.basic,
+            onHover: brushing
+                ? (e) {
+                    setState(() {
+                      _brushCursor = Offset(
+                        e.localPosition.dx / viewScale,
+                        e.localPosition.dy / viewScale,
+                      );
+                    });
+                  }
+                : null,
+            onExit: (_) {
+              if (_brushCursor != null) setState(() => _brushCursor = null);
             },
-            onScaleUpdate: (d) {
-              if (_brushMode != null) {
+            child: GestureDetector(
+              onScaleStart: (d) {
                 final live = _liveDoc.value ?? doc;
-                final sel = _selectedObject(live);
-                if (sel is MediaObject && sel.kind == MediaKind.image) {
-                  final canvasPt = Offset(
-                    d.localFocalPoint.dx / viewScale,
-                    d.localFocalPoint.dy / viewScale,
-                  );
-                  unawaited(_paintBrush(sel, canvasPt, _brushMode!));
-                }
-                return;
-              }
-              final id = _selectedId;
-              final current = _liveDoc.value ?? _doc;
-              if (id == null || _lastFocal == null || current == null) {
-                return;
-              }
-              final dx =
-                  (d.localFocalPoint.dx - _lastFocal!.dx) / viewScale;
-              final dy =
-                  (d.localFocalPoint.dy - _lastFocal!.dy) / viewScale;
-              _lastFocal = d.localFocalPoint;
-              CompositionObject? obj;
-              for (final o in current.objects) {
-                if (o.id == id) obj = o;
-              }
-              if (obj == null) return;
-              // Canvas-only update — no setState, no preview rebuild.
-              final next = updateTransform(
-                current,
-                id,
-                x: obj.transform.x + dx,
-                y: obj.transform.y + dy,
-                scaleX: _baseScale * d.scale,
-                scaleY: _baseScale * d.scale,
-                rotation:
-                    _baseRotation + d.rotation * 180 / 3.1415926535,
-              );
-              _doc = next;
-              _liveDoc.value = next;
-            },
-            onScaleEnd: (_) {
-              if (_brushMode != null) {
-                _commitPreview();
-                return;
-              }
-              if (_gestureStart != null && _doc != null) {
-                _past.add(_gestureStart!);
-                _future.clear();
-                _gestureStart = null;
-              }
-              // Commit previews once the gesture finishes.
-              setState(() => _previewDoc = _doc);
-            },
-            child: ListenableBuilder(
-              listenable: Listenable.merge([_liveDoc, _frameTick, _playheadTick]),
-              builder: (context, _) {
-                return CustomPaint(
-                  painter: _CompositionPainter(
-                    doc: _liveDoc.value ?? doc,
-                    images: Map.of(_images),
-                    playheadMs: _playheadMs,
-                  ),
-                  size: Size(side, side),
+                final canvasPt = Offset(
+                  d.localFocalPoint.dx / viewScale,
+                  d.localFocalPoint.dy / viewScale,
                 );
+                if (_maskMode == 'polygon') {
+                  final sel = _selectedObject(live);
+                  if (sel is MediaObject && sel.kind == MediaKind.image) {
+                    setState(() => _polygonPoints.add(canvasPt));
+                  }
+                  return;
+                }
+                if (_maskMode == 'add' || _maskMode == 'remove') {
+                  final sel = _selectedObject(live);
+                  if (sel is MediaObject && sel.kind == MediaKind.image) {
+                    setState(() => _brushCursor = canvasPt);
+                    unawaited(_paintBrush(sel, canvasPt, _maskMode!));
+                  }
+                  return;
+                }
+                _gestureStart = live;
+                _lastFocal = d.localFocalPoint;
+                var id = _selectedId;
+                id ??= _hitTest(live, d.localFocalPoint, viewScale);
+                if (id == null) {
+                  final media = live.objects.whereType<MediaObject>();
+                  if (media.isNotEmpty) id = media.first.id;
+                }
+                _selectedId = id;
+                CompositionObject? obj;
+                for (final o in live.objects) {
+                  if (o.id == id) obj = o;
+                }
+                if (obj != null) {
+                  _baseScale = obj.transform.scaleX;
+                  _baseRotation = obj.transform.rotation;
+                }
+                setState(() {});
               },
+              onScaleUpdate: (d) {
+                final canvasPt = Offset(
+                  d.localFocalPoint.dx / viewScale,
+                  d.localFocalPoint.dy / viewScale,
+                );
+                if (_maskMode == 'polygon') return;
+                if (_maskMode == 'add' || _maskMode == 'remove') {
+                  final live = _liveDoc.value ?? doc;
+                  final sel = _selectedObject(live);
+                  if (sel is MediaObject && sel.kind == MediaKind.image) {
+                    setState(() => _brushCursor = canvasPt);
+                    unawaited(_paintBrush(sel, canvasPt, _maskMode!));
+                  }
+                  return;
+                }
+                final id = _selectedId;
+                final current = _liveDoc.value ?? _doc;
+                if (id == null || _lastFocal == null || current == null) {
+                  return;
+                }
+                final dx =
+                    (d.localFocalPoint.dx - _lastFocal!.dx) / viewScale;
+                final dy =
+                    (d.localFocalPoint.dy - _lastFocal!.dy) / viewScale;
+                _lastFocal = d.localFocalPoint;
+                CompositionObject? obj;
+                for (final o in current.objects) {
+                  if (o.id == id) obj = o;
+                }
+                if (obj == null) return;
+                final next = updateTransform(
+                  current,
+                  id,
+                  x: obj.transform.x + dx,
+                  y: obj.transform.y + dy,
+                  scaleX: _baseScale * d.scale,
+                  scaleY: _baseScale * d.scale,
+                  rotation:
+                      _baseRotation + d.rotation * 180 / 3.1415926535,
+                );
+                _doc = next;
+                _liveDoc.value = next;
+              },
+              onScaleEnd: (_) {
+                if (_maskMode != null) {
+                  if (_maskMode == 'add' || _maskMode == 'remove') {
+                    _commitPreview();
+                  }
+                  return;
+                }
+                if (_gestureStart != null && _doc != null) {
+                  _past.add(_gestureStart!);
+                  _future.clear();
+                  _gestureStart = null;
+                }
+                setState(() => _previewDoc = _doc);
+              },
+              child: ListenableBuilder(
+                listenable:
+                    Listenable.merge([_liveDoc, _frameTick, _playheadTick]),
+                builder: (context, _) {
+                  return CustomPaint(
+                    painter: _CompositionPainter(
+                      doc: _liveDoc.value ?? doc,
+                      images: Map.of(_images),
+                      playheadMs: _playheadMs,
+                      brushCursor: brushing ? _brushCursor : null,
+                      brushSize: _brushSize,
+                      polygonPoints:
+                          _maskMode == 'polygon' ? List.of(_polygonPoints) : const [],
+                      accent: widget.primary,
+                    ),
+                    size: Size(side, side),
+                  );
+                },
+              ),
             ),
           ),
         ),
@@ -772,149 +1004,312 @@ class _BlobEditorState extends State<BlobEditor> {
     );
   }
 
-  Widget? _buildControls(CompositionDocument doc, BlobChromeColors chrome) {
-    final sel = _selectedObject(doc);
+  Widget? _buildTimeline(CompositionDocument doc, BlobChromeColors chrome) {
+    if (doc.durationMs <= 0) return null;
     final medias = doc.objects.whereType<MediaObject>();
     final primaryMedia = medias.isEmpty ? null : medias.first;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       mainAxisSize: MainAxisSize.min,
       children: [
-        if (doc.durationMs > 0) ...[
-          ValueListenableBuilder<double>(
-            valueListenable: _playheadTick,
-            builder: (context, playhead, _) {
-              return Row(
-                children: [
-                  IconButton(
-                    tooltip: _playing ? 'Pause' : 'Play',
-                    iconSize: 28,
-                    style: IconButton.styleFrom(
-                      minimumSize: const Size(44, 44),
-                      foregroundColor: chrome.foreground,
-                    ),
-                    onPressed: _togglePlay,
-                    icon: Icon(_playing ? Icons.pause : Icons.play_arrow),
+        ValueListenableBuilder<double>(
+          valueListenable: _playheadTick,
+          builder: (context, playhead, _) {
+            return Row(
+              children: [
+                IconButton(
+                  tooltip: _playing ? 'Pause' : 'Play',
+                  iconSize: 28,
+                  style: IconButton.styleFrom(
+                    minimumSize: const Size(44, 44),
+                    foregroundColor: chrome.foreground,
                   ),
-                  Expanded(
-                    child: Text(
-                      'Timeline ${(playhead / 1000).toStringAsFixed(1)}s / ${(doc.durationMs / 1000).toStringAsFixed(1)}s',
-                      style: TextStyle(fontSize: 12, color: chrome.muted),
+                  onPressed: _togglePlay,
+                  icon: Icon(_playing ? Icons.pause : Icons.play_arrow),
+                ),
+                Expanded(
+                  child: Text(
+                    'Timeline ${(playhead / 1000).toStringAsFixed(1)}s / ${(doc.durationMs / 1000).toStringAsFixed(1)}s',
+                    style: TextStyle(fontSize: 12, color: chrome.muted),
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+        ValueListenableBuilder<double>(
+          valueListenable: _playheadTick,
+          builder: (context, playhead, _) {
+            return Slider(
+              min: 0,
+              max: doc.durationMs,
+              value: playhead.clamp(0, doc.durationMs),
+              onChanged: (v) {
+                if (_playing) {
+                  _playTimer?.cancel();
+                  setState(() => _playing = false);
+                }
+                _setPlayhead(v);
+              },
+              onChangeEnd: (v) => _setPlayhead(v, immediate: true),
+            );
+          },
+        ),
+        Wrap(
+          spacing: 6,
+          children: [
+            _chip(
+              'Trim end→playhead',
+              primaryMedia == null
+                  ? null
+                  : () {
+                      final keep = primaryMedia.keep ??
+                          TimeRange(startMs: 0, endMs: doc.durationMs);
+                      final end = math.max(
+                        keep.startMs + 100,
+                        keep.startMs + _playheadMs,
+                      );
+                      _push(syncDurationFromPrimary(
+                        setTrim(doc, primaryMedia.id, keep.startMs, end),
+                      ));
+                    },
+              chrome,
+            ),
+            _chip(
+              'Trim start→playhead',
+              primaryMedia == null
+                  ? null
+                  : () {
+                      final keep = primaryMedia.keep ??
+                          TimeRange(startMs: 0, endMs: doc.durationMs);
+                      final start = keep.startMs + _playheadMs;
+                      _push(syncDurationFromPrimary(
+                        setTrim(
+                          doc,
+                          primaryMedia.id,
+                          start,
+                          math.max(start + 100, keep.endMs),
+                        ),
+                      ));
+                    },
+              chrome,
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget? _buildToolPanel(
+    CompositionDocument doc,
+    BlobChromeColors chrome,
+    _ToolId? active,
+  ) {
+    if (active == null) return null;
+    final sel = _selectedObject(doc);
+    final selMedia = sel is MediaObject ? sel : null;
+    final isVideo =
+        doc.objects.any((o) => o is MediaObject && o.kind == MediaKind.video);
+
+    Widget? body;
+    switch (active) {
+      case _ToolId.transform:
+        if (sel == null) break;
+        body = _TransformInspector(
+          obj: sel,
+          chrome: chrome,
+          panelRadius: _radius,
+          onChange: (scale, rotation) {
+            final current = _doc ?? doc;
+            final o = _selectedObject(current);
+            if (o == null) return;
+            _live(
+              updateTransform(
+                current,
+                o.id,
+                scaleX: scale,
+                scaleY: scale,
+                rotation: rotation,
+              ),
+            );
+          },
+          onCommit: () {
+            if (_doc != null) {
+              _past.add(_previewDoc ?? _doc!);
+              _future.clear();
+            }
+            _commitPreview();
+          },
+        );
+      case _ToolId.crop:
+        if (selMedia == null) break;
+        body = BlobGlass(
+          colors: chrome,
+          borderRadius: _radius,
+          padding: const EdgeInsets.all(10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: _cropSliders(doc, selMedia, chrome),
+          ),
+        );
+      case _ToolId.cutout:
+        if (selMedia == null || selMedia.kind != MediaKind.image) break;
+        body = _buildCutoutInspector(doc, selMedia, chrome);
+      case _ToolId.text:
+        body = Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Wrap(
+              spacing: 6,
+              children: [
+                _chip('Add text', _addText, chrome),
+                if (!isVideo) _chip('Overlay', _pickOverlay, chrome),
+              ],
+            ),
+            if (sel is TextObject) ...[
+              const SizedBox(height: 8),
+              _TextInspector(
+                obj: sel,
+                chrome: chrome,
+                panelRadius: _radius,
+                pill: _pill,
+                onChange: (patch) {
+                  final t = _selectedText(_doc ?? doc);
+                  if (t == null) return;
+                  _live(
+                    updateText(
+                      _doc ?? doc,
+                      t.id,
+                      text: patch.text,
+                      fontSize: patch.fontSize,
+                      style: patch.style,
                     ),
+                  );
+                },
+                onCommit: () {
+                  if (_doc != null) {
+                    _past.add(_previewDoc ?? _doc!);
+                    _future.clear();
+                  }
+                  _commitPreview();
+                },
+              ),
+            ],
+          ],
+        );
+      case _ToolId.canvas:
+        body = Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (!isVideo)
+              Wrap(
+                spacing: 6,
+                children: [
+                  _chip(
+                    'Clear bg',
+                    () => _push(setBackground(doc, 'transparent')),
+                    chrome,
+                  ),
+                  _BgButton(
+                    current: doc.canvas.background,
+                    chrome: chrome,
+                    pill: _pill,
+                    onPick: (hex) => _push(setBackground(doc, hex)),
                   ),
                 ],
-              );
-            },
-          ),
-          ValueListenableBuilder<double>(
-            valueListenable: _playheadTick,
-            builder: (context, playhead, _) {
-              return Slider(
-                min: 0,
-                max: doc.durationMs,
-                value: playhead.clamp(0, doc.durationMs),
-                onChanged: (v) {
-                  if (_playing) {
-                    _playTimer?.cancel();
-                    setState(() => _playing = false);
-                  }
-                  _setPlayhead(v);
-                },
-                onChangeEnd: (v) => _setPlayhead(v, immediate: true),
-              );
-            },
-          ),
-          Wrap(
-            spacing: 6,
-            children: [
-              _chip(
-                'Trim end→playhead',
-                primaryMedia == null
-                    ? null
-                    : () {
-                        final keep = primaryMedia.keep ??
-                            TimeRange(startMs: 0, endMs: doc.durationMs);
-                        final end = math.max(
-                          keep.startMs + 100,
-                          keep.startMs + _playheadMs,
-                        );
-                        _push(syncDurationFromPrimary(
-                          setTrim(doc, primaryMedia.id, keep.startMs, end),
-                        ));
-                      },
-                chrome,
               ),
-              _chip(
-                'Trim start→playhead',
-                primaryMedia == null
-                    ? null
-                    : () {
-                        final keep = primaryMedia.keep ??
-                            TimeRange(startMs: 0, endMs: doc.durationMs);
-                        final start = keep.startMs + _playheadMs;
-                        _push(syncDurationFromPrimary(
-                          setTrim(
-                            doc,
-                            primaryMedia.id,
-                            start,
-                            math.max(start + 100, keep.endMs),
-                          ),
-                        ));
-                      },
-                chrome,
+            if (isVideo)
+              BlobGlass(
+                colors: chrome,
+                borderRadius: _radius,
+                padding: const EdgeInsets.all(10),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        'Remove original sound',
+                        style: TextStyle(
+                          color: chrome.foreground,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ),
+                    Switch(
+                      value: doc.audio?.muteSource ?? true,
+                      onChanged: (v) => _push(setMuteSource(doc, v)),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        );
+    }
+
+    if (body == null) return null;
+    return _ToolPanel(
+      title: _toolTitles[active]!,
+      chrome: chrome,
+      radius: _radius,
+      onClose: () => setState(() => _activeTool = null),
+      child: body,
+    );
+  }
+
+  Widget _buildCutoutInspector(
+    CompositionDocument doc,
+    MediaObject sel,
+    BlobChromeColors chrome,
+  ) {
+    final outline = sel.outline;
+    final brushing = _maskMode == 'add' || _maskMode == 'remove';
+    return BlobGlass(
+      colors: chrome,
+      borderRadius: _radius,
+      padding: const EdgeInsets.all(10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Checkbox(
+                value: outline != null,
+                onChanged: (v) {
+                  _push(setOutline(
+                    doc,
+                    sel.id,
+                    v == true
+                        ? const OutlineStyle(color: '#ffffff', width: 8)
+                        : null,
+                  ));
+                },
+              ),
+              Expanded(
+                child: Text(
+                  'White sticker border',
+                  style: TextStyle(color: chrome.foreground, fontSize: 13),
+                ),
               ),
             ],
           ),
-          const SizedBox(height: 8),
-        ],
-        if (sel != null) ...[
-          _TransformInspector(
-            obj: sel,
-            chrome: chrome,
-            panelRadius: _radius,
-            onChange: (scale, rotation) {
-              final current = _doc ?? doc;
-              final o = _selectedObject(current);
-              if (o == null) return;
-              _live(
-                updateTransform(
-                  current,
-                  o.id,
-                  scaleX: scale,
-                  scaleY: scale,
-                  rotation: rotation,
-                ),
-              );
-            },
-            onCommit: () {
-              if (_doc != null) {
-                _past.add(_previewDoc ?? _doc!);
-                _future.clear();
-              }
-              _commitPreview();
-            },
-          ),
-          if (sel is TextObject) ...[
-            const SizedBox(height: 8),
-            _TextInspector(
-              obj: sel,
-              chrome: chrome,
-              panelRadius: _radius,
-              pill: _pill,
-              onChange: (patch) {
-                final t = _selectedText(_doc ?? doc);
-                if (t == null) return;
-                _live(
-                  updateText(
-                    _doc ?? doc,
-                    t.id,
-                    text: patch.text,
-                    fontSize: patch.fontSize,
-                    style: patch.style,
-                  ),
-                );
+          if (outline != null) ...[
+            Text(
+              'Border width ${outline.width.round()}',
+              style: TextStyle(fontSize: 12, color: chrome.muted),
+            ),
+            Slider(
+              min: 2,
+              max: 32,
+              value: outline.width.clamp(2, 32),
+              onChanged: (v) {
+                _live(setOutline(
+                  doc,
+                  sel.id,
+                  OutlineStyle(color: outline.color, width: v),
+                ));
               },
-              onCommit: () {
+              onChangeEnd: (_) {
                 if (_doc != null) {
                   _past.add(_previewDoc ?? _doc!);
                   _future.clear();
@@ -923,92 +1318,77 @@ class _BlobEditorState extends State<BlobEditor> {
               },
             ),
           ],
-          if (sel is MediaObject) ...[
-            const SizedBox(height: 8),
-            BlobGlass(
-              colors: chrome,
-              borderRadius: _radius,
-              padding: const EdgeInsets.all(10),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Text('Crop', style: TextStyle(fontSize: 12, color: chrome.muted)),
-                  ..._cropSliders(doc, sel, chrome),
-                  if (sel.kind == MediaKind.image) ...[
-                    const SizedBox(height: 6),
-                    Text('Cutout', style: TextStyle(fontSize: 12, color: chrome.muted)),
-                    Wrap(
-                      spacing: 6,
-                      children: [
-                        _chip(
-                          _removingBg ? 'Removing…' : 'Remove BG',
-                          (_removingBg || widget.onRemoveBackground == null)
-                              ? null
-                              : () => unawaited(_removeBackground(sel)),
-                          chrome,
-                        ),
-                        _chip(
-                          sel.outline == null ? 'White border' : 'Clear border',
-                          () => _push(setOutline(
-                            doc,
-                            sel.id,
-                            sel.outline == null
-                                ? const OutlineStyle(color: '#ffffff', width: 8)
-                                : null,
-                          )),
-                          chrome,
-                        ),
-                        _chip(
-                          _brushMode == 'add' ? 'Brush+ ON' : 'Brush add',
-                          () => setState(() =>
-                              _brushMode = _brushMode == 'add' ? null : 'add'),
-                          chrome,
-                        ),
-                        _chip(
-                          _brushMode == 'remove' ? 'Brush− ON' : 'Brush remove',
-                          () => setState(() => _brushMode =
-                              _brushMode == 'remove' ? null : 'remove'),
-                          chrome,
-                        ),
-                        _chip(
-                          'Clear mask',
-                          () {
-                            setState(() => _brushMode = null);
-                            _push(applyMask(doc, sel.id, null));
-                          },
-                          chrome,
-                        ),
-                      ],
-                    ),
-                  ],
-                ],
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              _chip(
+                'Brush add',
+                () => _setMaskMode(_maskMode == 'add' ? null : 'add'),
+                chrome,
+                primary: _maskMode == 'add',
               ),
+              _chip(
+                'Brush remove',
+                () => _setMaskMode(_maskMode == 'remove' ? null : 'remove'),
+                chrome,
+                primary: _maskMode == 'remove',
+              ),
+              _chip(
+                'Polygon',
+                () => _setMaskMode(_maskMode == 'polygon' ? null : 'polygon'),
+                chrome,
+                primary: _maskMode == 'polygon',
+              ),
+            ],
+          ),
+          if (brushing) ...[
+            const SizedBox(height: 4),
+            Text(
+              'Brush size ${_brushSize.round()}',
+              style: TextStyle(fontSize: 12, color: chrome.muted),
+            ),
+            Slider(
+              min: 8,
+              max: 64,
+              value: _brushSize.clamp(8, 64),
+              onChanged: (v) => setState(() => _brushSize = v),
             ),
           ],
-        ],
-        if (doc.objects.whereType<MediaObject>().any((m) => m.kind == MediaKind.video)) ...[
-          const SizedBox(height: 8),
-          BlobGlass(
-            colors: chrome,
-            borderRadius: _radius,
-            padding: const EdgeInsets.all(10),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    'Remove original sound',
-                    style: TextStyle(color: chrome.foreground, fontSize: 13),
-                  ),
-                ),
-                Switch(
-                  value: doc.audio?.muteSource ?? true,
-                  onChanged: (v) => _push(setMuteSource(doc, v)),
-                ),
-              ],
+          if (_maskMode == 'polygon')
+            Padding(
+              padding: const EdgeInsets.only(top: 4, bottom: 4),
+              child: Text(
+                'Tap ≥3 points (auto-closes). Then Apply mask.',
+                style: TextStyle(fontSize: 11, color: chrome.muted),
+              ),
             ),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 6,
+            children: [
+              _chip(
+                'Apply mask',
+                () => unawaited(_handleApplyMask()),
+                chrome,
+                primary: true,
+              ),
+              _chip(
+                'Clear mask',
+                () {
+                  setState(() {
+                    _maskMode = null;
+                    _polygonPoints.clear();
+                    _brushCursor = null;
+                  });
+                  _push(applyMask(doc, sel.id, null));
+                },
+                chrome,
+              ),
+            ],
           ),
         ],
-      ],
+      ),
     );
   }
 
@@ -1065,42 +1445,6 @@ class _BlobEditorState extends State<BlobEditor> {
     ];
   }
 
-  Widget _buildToolbar(CompositionDocument doc, BlobChromeColors chrome) {
-    final isVideo =
-        doc.objects.any((o) => o is MediaObject && o.kind == MediaKind.video);
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      crossAxisAlignment: WrapCrossAlignment.center,
-      children: [
-        _chip('Undo', _past.isNotEmpty ? _undo : null, chrome),
-        _chip('Redo', _future.isNotEmpty ? _redo : null, chrome),
-        _chip('Text', _addText, chrome),
-        if (!isVideo) _chip('Overlay', _pickOverlay, chrome),
-        if (!isVideo) ...[
-          _chip(
-            'Clear bg',
-            () => _push(setBackground(doc, 'transparent')),
-            chrome,
-          ),
-          _BgButton(
-            current: doc.canvas.background,
-            chrome: chrome,
-            pill: _pill,
-            onPick: (hex) => _push(setBackground(doc, hex)),
-          ),
-        ],
-        if (widget.onCancel != null)
-          _chip('Cancel', widget.onCancel, chrome, ghost: true),
-        FilledButton(
-          style: _filledStyle(),
-          onPressed: _exporting ? null : _doExport,
-          child: Text(_exporting ? 'Export…' : 'Export'),
-        ),
-      ],
-    );
-  }
-
   CompositionObject? _selectedObject(CompositionDocument doc) {
     final id = _selectedId;
     if (id == null) return null;
@@ -1121,7 +1465,10 @@ class _BlobEditorState extends State<BlobEditor> {
     final next = addText(current);
     final id = next.objects.last.id;
     _push(next);
-    setState(() => _selectedId = id);
+    setState(() {
+      _selectedId = id;
+      _activeTool = _ToolId.text;
+    });
   }
 
   /// Rough hit-test in view coords → object id (topmost wins).
@@ -1157,12 +1504,17 @@ class _BlobEditorState extends State<BlobEditor> {
     VoidCallback? onPressed,
     BlobChromeColors chrome, {
     bool ghost = false,
+    bool primary = false,
   }) {
     return TextButton(
       style: TextButton.styleFrom(
         minimumSize: const Size(44, 44),
-        foregroundColor: chrome.foreground,
-        backgroundColor: ghost ? null : chrome.btn,
+        foregroundColor: primary ? widget.onPrimary : chrome.foreground,
+        backgroundColor: primary
+            ? widget.primary
+            : ghost
+                ? null
+                : chrome.btn,
         shape: RoundedRectangleBorder(
           borderRadius: _pill,
           side: BorderSide(color: chrome.btnBorder),
@@ -1174,16 +1526,155 @@ class _BlobEditorState extends State<BlobEditor> {
   }
 }
 
+class _ToolNav extends StatelessWidget {
+  const _ToolNav({
+    required this.tools,
+    required this.active,
+    required this.onSelect,
+    required this.vertical,
+    required this.chrome,
+    required this.pill,
+    required this.primary,
+    required this.onPrimary,
+  });
+
+  final List<({_ToolId id, String label})> tools;
+  final _ToolId? active;
+  final void Function(_ToolId id) onSelect;
+  final bool vertical;
+  final BlobChromeColors chrome;
+  final BorderRadius pill;
+  final Color primary;
+  final Color onPrimary;
+
+  @override
+  Widget build(BuildContext context) {
+    if (tools.isEmpty) return const SizedBox.shrink();
+    final kids = [
+      for (final t in tools)
+        SizedBox(
+          height: 44,
+          width: vertical ? double.infinity : null,
+          child: TextButton(
+            style: TextButton.styleFrom(
+              minimumSize: const Size(44, 44),
+              maximumSize: const Size(double.infinity, 44),
+              foregroundColor:
+                  active == t.id ? onPrimary : chrome.foreground,
+              backgroundColor: active == t.id ? primary : chrome.btn,
+              shape: RoundedRectangleBorder(
+                borderRadius: pill,
+                side: BorderSide(color: chrome.btnBorder),
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+            ),
+            onPressed: () => onSelect(t.id),
+            child: Text(t.label, overflow: TextOverflow.ellipsis),
+          ),
+        ),
+    ];
+    if (vertical) {
+      return SizedBox(
+        width: 88,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            for (var i = 0; i < kids.length; i++) ...[
+              if (i > 0) const SizedBox(height: 4),
+              kids[i],
+            ],
+          ],
+        ),
+      );
+    }
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(
+        children: [
+          for (var i = 0; i < kids.length; i++) ...[
+            if (i > 0) const SizedBox(width: 4),
+            kids[i],
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _ToolPanel extends StatelessWidget {
+  const _ToolPanel({
+    required this.title,
+    required this.chrome,
+    required this.radius,
+    required this.onClose,
+    required this.child,
+  });
+
+  final String title;
+  final BlobChromeColors chrome;
+  final BorderRadius radius;
+  final VoidCallback onClose;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return BlobGlass(
+      colors: chrome,
+      borderRadius: radius,
+      padding: const EdgeInsets.all(10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: chrome.muted,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              TextButton(
+                style: TextButton.styleFrom(
+                  minimumSize: const Size(44, 36),
+                  foregroundColor: chrome.foreground,
+                ),
+                onPressed: onClose,
+                child: const Text('Close'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          child,
+        ],
+      ),
+    );
+  }
+}
+
 class _CompositionPainter extends CustomPainter {
   _CompositionPainter({
     required this.doc,
     required this.images,
     this.playheadMs = 0,
+    this.brushCursor,
+    this.brushSize = 28,
+    this.polygonPoints = const [],
+    this.accent = const Color(0xFFF10EA0),
   });
 
   final CompositionDocument doc;
   final Map<String, ui.Image> images;
   final double playheadMs;
+  final Offset? brushCursor;
+  final double brushSize;
+  final List<Offset> polygonPoints;
+  final Color accent;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1195,11 +1686,55 @@ class _CompositionPainter extends CustomPainter {
       (id) => images[id],
       tMs: playheadMs,
     );
+
+    final stroke = Paint()
+      ..color = accent
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2;
+
+    if (polygonPoints.isNotEmpty) {
+      final path = Path();
+      for (var i = 0; i < polygonPoints.length; i++) {
+        final p = polygonPoints[i];
+        if (i == 0) {
+          path.moveTo(p.dx, p.dy);
+        } else {
+          path.lineTo(p.dx, p.dy);
+        }
+      }
+      if (polygonPoints.length >= 3) path.close();
+      canvas.drawPath(path, stroke);
+      for (final p in polygonPoints) {
+        canvas.drawCircle(p, 5, Paint()..color = accent);
+      }
+    }
+
+    if (brushCursor != null) {
+      canvas.drawCircle(
+        brushCursor!,
+        brushSize,
+        stroke..strokeWidth = 2,
+      );
+      // Dashed feel: second lighter ring
+      canvas.drawCircle(
+        brushCursor!,
+        brushSize,
+        Paint()
+          ..color = accent.withValues(alpha: 0.35)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1,
+      );
+    }
   }
 
   @override
   bool shouldRepaint(covariant _CompositionPainter old) =>
-      old.doc != doc || old.images != images || old.playheadMs != playheadMs;
+      old.doc != doc ||
+      old.images != images ||
+      old.playheadMs != playheadMs ||
+      old.brushCursor != brushCursor ||
+      old.brushSize != brushSize ||
+      old.polygonPoints != polygonPoints;
 }
 
 class _PreviewRow extends StatefulWidget {
